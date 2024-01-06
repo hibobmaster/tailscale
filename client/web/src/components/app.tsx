@@ -12,6 +12,8 @@ import SubnetRouterView from "src/components/views/subnet-router-view"
 import { UpdatingView } from "src/components/views/updating-view"
 import useAuth, { AuthResponse } from "src/hooks/auth"
 import { Feature, featureDescription, NodeData } from "src/types"
+import Card from "src/ui/card"
+import EmptyState from "src/ui/empty-state"
 import LoadingDots from "src/ui/loading-dots"
 import useSWR from "swr"
 import { Link, Route, Router, Switch, useLocation } from "wouter"
@@ -64,15 +66,22 @@ function WebClient({
           <FeatureRoute path="/ssh" feature="ssh" node={node}>
             <SSHView readonly={!auth.canManageNode} node={node} />
           </FeatureRoute>
-          <Route path="/serve">{/* TODO */}Share local content</Route>
+          {/* <Route path="/serve">Share local content</Route> */}
           <FeatureRoute path="/update" feature="auto-update" node={node}>
             <UpdatingView
               versionInfo={node.ClientVersion}
               currentVersion={node.IPNVersion}
             />
           </FeatureRoute>
+          <Route path="/disconnected">
+            <Card className="mt-8">
+              <EmptyState description="You have been disconnected" />
+            </Card>
+          </Route>
           <Route>
-            <div className="mt-8 card">Page not found</div>
+            <Card className="mt-8">
+              <EmptyState description="Page not found" />
+            </Card>
           </Route>
         </Switch>
       </Router>
@@ -100,9 +109,13 @@ function FeatureRoute({
   return (
     <Route path={path}>
       {!node.Features[feature] ? (
-        <div className="mt-8 card">
-          {featureDescription(feature)} not available on this device.
-        </div>
+        <Card className="mt-8">
+          <EmptyState
+            description={`${featureDescription(
+              feature
+            )} not available on this device.`}
+          />
+        </Card>
       ) : (
         children
       )}
@@ -120,6 +133,11 @@ function Header({
   newSession: () => Promise<void>
 }) {
   const [loc] = useLocation()
+
+  if (loc === "/disconnected") {
+    // No header on view presented after logout.
+    return null
+  }
 
   return (
     <>

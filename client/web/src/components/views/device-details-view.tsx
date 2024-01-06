@@ -10,6 +10,8 @@ import NiceIP from "src/components/nice-ip"
 import { UpdateAvailableNotification } from "src/components/update-available"
 import { NodeData } from "src/types"
 import Button from "src/ui/button"
+import Card from "src/ui/card"
+import Dialog from "src/ui/dialog"
 import QuickCopy from "src/ui/quick-copy"
 import { useLocation } from "wouter"
 
@@ -20,14 +22,11 @@ export default function DeviceDetailsView({
   readonly: boolean
   node: NodeData
 }) {
-  const api = useAPI()
-  const [, setLocation] = useLocation()
-
   return (
     <>
       <h1 className="mb-10">Device details</h1>
       <div className="flex flex-col gap-4">
-        <div className="-mx-5 card">
+        <Card noPadding className="-mx-5 p-5 details-card">
           <div className="flex items-center justify-between">
             <div className="flex items-center gap-2">
               <h1>{node.DeviceName}</h1>
@@ -38,25 +37,16 @@ export default function DeviceDetailsView({
                 })}
               />
             </div>
-            {!readonly && (
-              <Button
-                sizeVariant="small"
-                onClick={() =>
-                  api({ action: "logout" }).then(() => setLocation("/"))
-                }
-              >
-                Disconnect…
-              </Button>
-            )}
+            {!readonly && <DisconnectDialog />}
           </div>
-        </div>
+        </Card>
         {node.Features["auto-update"] &&
           !readonly &&
           node.ClientVersion &&
           !node.ClientVersion.RunningLatest && (
             <UpdateAvailableNotification details={node.ClientVersion} />
           )}
-        <div className="-mx-5 card">
+        <Card noPadding className="-mx-5 p-5 details-card">
           <h2 className="mb-2">General</h2>
           <table>
             <tbody>
@@ -104,13 +94,15 @@ export default function DeviceDetailsView({
                   {node.KeyExpired
                     ? "Expired"
                     : // TODO: present as relative expiry (e.g. "5 months from now")
-                      new Date(node.KeyExpiry).toLocaleString()}
+                    node.KeyExpiry
+                    ? new Date(node.KeyExpiry).toLocaleString()
+                    : "No expiry"}
                 </td>
               </tr>
             </tbody>
           </table>
-        </div>
-        <div className="-mx-5 card">
+        </Card>
+        <Card noPadding className="-mx-5 p-5 details-card">
           <h2 className="mb-2">Addresses</h2>
           <table>
             <tbody>
@@ -160,7 +152,24 @@ export default function DeviceDetailsView({
               </tr>
             </tbody>
           </table>
-        </div>
+        </Card>
+        <Card noPadding className="-mx-5 p-5 details-card">
+          <h2 className="mb-2">Debug</h2>
+          <table>
+            <tbody>
+              <tr>
+                <td>TUN Mode</td>
+                <td>{node.TUNMode ? "Yes" : "No"}</td>
+              </tr>
+              {node.IsSynology && (
+                <tr>
+                  <td>Synology Version</td>
+                  <td>{node.DSMVersion}</td>
+                </tr>
+              )}
+            </tbody>
+          </table>
+        </Card>
         <footer className="text-gray-500 text-sm leading-tight text-center">
           <Control.AdminContainer node={node}>
             Want even more details? Visit{" "}
@@ -207,5 +216,35 @@ export default function DeviceDetailsView({
         </footer>
       </div>
     </>
+  )
+}
+
+function DisconnectDialog() {
+  const api = useAPI()
+  const [, setLocation] = useLocation()
+
+  return (
+    <Dialog
+      className="max-w-md"
+      title="Disconnect"
+      trigger={<Button sizeVariant="small">Disconnect…</Button>}
+    >
+      <Dialog.Form
+        cancelButton
+        submitButton="Disconnect"
+        destructive
+        onSubmit={() => {
+          api({ action: "logout" })
+          setLocation("/disconnected")
+        }}
+      >
+        You are about to disconnect this device from your tailnet. To reconnect,
+        you will be required to re-authenticate this device.
+        <p className="mt-4 text-sm text-text-muted">
+          Your connection to this web interface will end as soon as you click
+          disconnect.
+        </p>
+      </Dialog.Form>
+    </Dialog>
   )
 }

@@ -12,6 +12,7 @@ export enum AuthType {
 export type AuthResponse = {
   authNeeded?: AuthType
   canManageNode: boolean
+  serverMode: "login" | "manage"
   viewerIdentity?: {
     loginName: string
     nodeName: string
@@ -25,6 +26,7 @@ export type AuthResponse = {
 export default function useAuth() {
   const [data, setData] = useState<AuthResponse>()
   const [loading, setLoading] = useState<boolean>(true)
+  const [ranSynoAuth, setRanSynoAuth] = useState<boolean>(false)
 
   const loadAuth = useCallback(() => {
     setLoading(true)
@@ -37,6 +39,7 @@ export default function useAuth() {
               .then((r) => r.json())
               .then((a) => {
                 setSynoToken(a.SynoToken)
+                setRanSynoAuth(true)
                 setLoading(false)
               })
             break
@@ -78,6 +81,11 @@ export default function useAuth() {
     })
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
+
+  useEffect(() => {
+    loadAuth() // Refresh auth state after syno auth runs
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [ranSynoAuth])
 
   return {
     data,

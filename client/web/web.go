@@ -15,6 +15,7 @@ import (
 	"net/http"
 	"net/netip"
 	"os"
+	"path"
 	"path/filepath"
 	"slices"
 	"strings"
@@ -26,6 +27,7 @@ import (
 	"tailscale.com/client/tailscale/apitype"
 	"tailscale.com/clientupdate"
 	"tailscale.com/envknob"
+	"tailscale.com/hostinfo"
 	"tailscale.com/ipn"
 	"tailscale.com/ipn/ipnstate"
 	"tailscale.com/licenses"
@@ -34,6 +36,7 @@ import (
 	"tailscale.com/tailcfg"
 	"tailscale.com/types/logger"
 	"tailscale.com/util/httpm"
+	"tailscale.com/version"
 	"tailscale.com/version/distro"
 )
 
@@ -172,6 +175,13 @@ func NewServer(opts ServerOpts) (s *Server, err error) {
 		newAuthURL:  opts.NewAuthURL,
 		waitAuthURL: opts.WaitAuthURL,
 	}
+	if opts.PathPrefix != "" {
+		// In enforcePrefix, we add the necessary leading '/'. If we did not
+		// strip 1 or more leading '/'s here, we would end up redirecting
+		// clients to e.g. //example.com (a schema-less URL that points to
+		// another site). See https://github.com/tailscale/corp/issues/16268.
+		s.pathPrefix = strings.TrimLeft(path.Clean(opts.PathPrefix), "/\\")
+	}
 	if s.mode == ManageServerMode {
 		if opts.NewAuthURL == nil {
 			return nil, fmt.Errorf("must provide a NewAuthURL implementation")
@@ -227,7 +237,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	handler := s.serve
 
 	// if path prefix is defined, strip it from requests.
-	if s.pathPrefix != "" {
+	if s.cgiMode && s.pathPrefix != "" {
 		handler = enforcePrefix(s.pathPrefix, handler)
 	}
 
@@ -249,9 +259,13 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request) {
 		}
 
 		if !s.devMode {
+			// This hash corresponds to the inline script in index.html that runs when the react app is unavailable.
+			// It was generated from https://csplite.com/csp/sha/.
+			// If the contents of the script are changed, this hash must be updated.
+			const indexScriptHash = "sha384-CW2AYVfS14P7QHZN27thEkMLKiCj3YNURPoLc1elwiEkMVHeuYTWkJOEki1F3nZc"
+
 			w.Header().Set("X-Frame-Options", "DENY")
-			// TODO: use CSP nonce or hash to eliminate need for unsafe-inline
-			w.Header().Set("Content-Security-Policy", "default-src 'self' 'unsafe-inline'; img-src * data:")
+			w.Header().Set("Content-Security-Policy", "default-src 'self'; img-src * data:; script-src 'self' '"+indexScriptHash+"'")
 			w.Header().Set("Cross-Origin-Resource-Policy", "same-origin")
 		}
 	}
@@ -275,9 +289,6 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request) {
 		// Pass API requests through to the API handler.
 		s.apiHandler.ServeHTTP(w, r)
 		return
-	}
-	if !s.devMode {
-		s.lc.IncrementCounter(r.Context(), "web_client_page_load", 1)
 	}
 	s.assetsHandler.ServeHTTP(w, r)
 }
@@ -303,22 +314,61 @@ func (s *Server) requireTailscaleIP(w http.ResponseWriter, r *http.Request) (han
 		return true
 	}
 
-	var ipv4 string // store the first IPv4 address we see for redirect later
-	for _, ip := range st.Self.TailscaleIPs {
-		if ip.Is4() {
-			if r.Host == fmt.Sprintf("%s:%d", ip, ListenPort) {
-				return false
-			}
-			ipv4 = ip.String()
-		}
-		if ip.Is6() && r.Host == fmt.Sprintf("[%s]:%d", ip, ListenPort) {
-			return false
-		}
+	ipv4, ipv6 := s.selfNodeAddresses(r, st)
+	if r.Host == fmt.Sprintf("%s:%d", ipv4.String(), ListenPort) {
+		return false // already accessing over Tailscale IP
 	}
+	if r.Host == fmt.Sprintf("[%s]:%d", ipv6.String(), ListenPort) {
+		return false // already accessing over Tailscale IP
+	}
+
+	// Not currently accessing via Tailscale IP,
+	// redirect them.
+
+	var preferV6 bool
+	if ap, err := netip.ParseAddrPort(r.Host); err == nil {
+		// If Host was already ipv6, keep them on same protocol.
+		preferV6 = ap.Addr().Is6()
+	}
+
 	newURL := *r.URL
-	newURL.Host = fmt.Sprintf("%s:%d", ipv4, ListenPort)
+	if (preferV6 && ipv6.IsValid()) || !ipv4.IsValid() {
+		newURL.Host = fmt.Sprintf("[%s]:%d", ipv6.String(), ListenPort)
+	} else {
+		newURL.Host = fmt.Sprintf("%s:%d", ipv4.String(), ListenPort)
+	}
 	http.Redirect(w, r, newURL.String(), http.StatusMovedPermanently)
 	return true
+}
+
+// selfNodeAddresses return the Tailscale IPv4 and IPv6 addresses for the self node.
+// st is expected to be a status with peers included.
+func (s *Server) selfNodeAddresses(r *http.Request, st *ipnstate.Status) (ipv4, ipv6 netip.Addr) {
+	for _, ip := range st.Self.TailscaleIPs {
+		if ip.Is4() {
+			ipv4 = ip
+		} else if ip.Is6() {
+			ipv6 = ip
+		}
+		if ipv4.IsValid() && ipv6.IsValid() {
+			break // found both IPs
+		}
+	}
+	if whois, err := s.lc.WhoIs(r.Context(), r.RemoteAddr); err == nil {
+		// The source peer connecting to this node may know it by a different
+		// IP than the node knows itself as. Specifically, this may be the case
+		// if the peer is coming from a different tailnet (sharee node), as IPs
+		// are specific to each tailnet.
+		// Here, we check if the source peer knows the node by a different IP,
+		// and return the peer's version if so.
+		if knownIPv4 := whois.Node.SelfNodeV4MasqAddrForThisPeer; knownIPv4 != nil {
+			ipv4 = *knownIPv4
+		}
+		if knownIPv6 := whois.Node.SelfNodeV6MasqAddrForThisPeer; knownIPv6 != nil {
+			ipv6 = *knownIPv6
+		}
+	}
+	return ipv4, ipv6
 }
 
 // authorizeRequest reports whether the request from the web client
@@ -328,7 +378,7 @@ func (s *Server) requireTailscaleIP(w http.ResponseWriter, r *http.Request) (han
 // errors to the ResponseWriter itself.
 func (s *Server) authorizeRequest(w http.ResponseWriter, r *http.Request) (ok bool) {
 	if s.mode == ManageServerMode { // client using tailscale auth
-		session, _, err := s.getSession(r)
+		session, _, _, err := s.getSession(r)
 		switch {
 		case errors.Is(err, errNotUsingTailscale):
 			// All requests must be made over tailscale.
@@ -336,6 +386,9 @@ func (s *Server) authorizeRequest(w http.ResponseWriter, r *http.Request) (ok bo
 			return false
 		case r.URL.Path == "/api/data" && r.Method == httpm.GET:
 			// Readonly endpoint allowed without valid browser session.
+			return true
+		case r.URL.Path == "/api/device-details-click" && r.Method == httpm.POST:
+			// Special case metric endpoint that is allowed without a browser session.
 			return true
 		case strings.HasPrefix(r.URL.Path, "/api/"):
 			// All other /api/ endpoints require a valid browser session.
@@ -372,6 +425,8 @@ func (s *Server) serveLoginAPI(w http.ResponseWriter, r *http.Request) {
 		s.serveGetNodeData(w, r)
 	case r.URL.Path == "/api/up" && r.Method == httpm.POST:
 		s.serveTailscaleUp(w, r)
+	case r.URL.Path == "/api/device-details-click" && r.Method == httpm.POST:
+		s.serveDeviceDetailsClick(w, r)
 	default:
 		http.Error(w, "invalid endpoint or method", http.StatusNotFound)
 	}
@@ -388,6 +443,7 @@ type authResponse struct {
 	AuthNeeded     authType        `json:"authNeeded,omitempty"` // filled when user needs to complete a specific type of auth
 	CanManageNode  bool            `json:"canManageNode"`
 	ViewerIdentity *viewerIdentity `json:"viewerIdentity,omitempty"`
+	ServerMode     ServerMode      `json:"serverMode"`
 }
 
 // viewerIdentity is the Tailscale identity of the source node
@@ -403,46 +459,8 @@ type viewerIdentity struct {
 // and returns an authResponse indicating the current auth state and any steps the user needs to take.
 func (s *Server) serveAPIAuth(w http.ResponseWriter, r *http.Request) {
 	var resp authResponse
-
-	session, whois, err := s.getSession(r)
-	switch {
-	case err != nil && errors.Is(err, errNotUsingTailscale):
-		// not using tailscale, so perform platform auth
-		switch distro.Get() {
-		case distro.Synology:
-			authorized, err := authorizeSynology(r)
-			if err != nil {
-				http.Error(w, err.Error(), http.StatusUnauthorized)
-				return
-			}
-			if !authorized {
-				resp.AuthNeeded = synoAuth
-			}
-		case distro.QNAP:
-			if _, err := authorizeQNAP(r); err != nil {
-				http.Error(w, err.Error(), http.StatusUnauthorized)
-				return
-			}
-		default:
-			// no additional auth for this distro
-		}
-	case err != nil && (errors.Is(err, errNotOwner) ||
-		errors.Is(err, errNotUsingTailscale) ||
-		errors.Is(err, errTaggedLocalSource) ||
-		errors.Is(err, errTaggedRemoteSource)):
-		// These cases are all restricted to the readonly view.
-		// No auth action to take.
-		resp.AuthNeeded = ""
-	case err != nil && !errors.Is(err, errNoSession):
-		// Any other error.
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	case session.isAuthorized(s.timeNow()):
-		resp.CanManageNode = true
-		resp.AuthNeeded = ""
-	default:
-		resp.AuthNeeded = tailscaleAuth
-	}
+	resp.ServerMode = s.mode
+	session, whois, status, sErr := s.getSession(r)
 
 	if whois != nil {
 		resp.ViewerIdentity = &viewerIdentity{
@@ -454,6 +472,71 @@ func (s *Server) serveAPIAuth(w http.ResponseWriter, r *http.Request) {
 			resp.ViewerIdentity.NodeIP = addrs[0].Addr().String()
 		}
 	}
+
+	// First verify platform auth.
+	// If platform auth is needed, this should happen first.
+	if s.mode == LoginServerMode {
+		switch distro.Get() {
+		case distro.Synology:
+			authorized, err := authorizeSynology(r)
+			if err != nil {
+				http.Error(w, err.Error(), http.StatusUnauthorized)
+				return
+			}
+			if !authorized {
+				resp.AuthNeeded = synoAuth
+				writeJSON(w, resp)
+				return
+			}
+		case distro.QNAP:
+			if _, err := authorizeQNAP(r); err != nil {
+				http.Error(w, err.Error(), http.StatusUnauthorized)
+				return
+			}
+		default:
+			// no additional auth for this distro
+		}
+	}
+
+	switch {
+	case sErr != nil && errors.Is(sErr, errNotUsingTailscale):
+		// Restricted to the readonly view, no auth action to take.
+		s.lc.IncrementCounter(r.Context(), "web_client_viewing_local", 1)
+		resp.AuthNeeded = ""
+	case sErr != nil && errors.Is(sErr, errNotOwner):
+		// Restricted to the readonly view, no auth action to take.
+		s.lc.IncrementCounter(r.Context(), "web_client_viewing_not_owner", 1)
+		resp.AuthNeeded = ""
+	case sErr != nil && errors.Is(sErr, errTaggedLocalSource):
+		// Restricted to the readonly view, no auth action to take.
+		s.lc.IncrementCounter(r.Context(), "web_client_viewing_local_tag", 1)
+		resp.AuthNeeded = ""
+	case sErr != nil && errors.Is(sErr, errTaggedRemoteSource):
+		// Restricted to the readonly view, no auth action to take.
+		s.lc.IncrementCounter(r.Context(), "web_client_viewing_remote_tag", 1)
+		resp.AuthNeeded = ""
+	case sErr != nil && !errors.Is(sErr, errNoSession):
+		// Any other error.
+		http.Error(w, sErr.Error(), http.StatusInternalServerError)
+		return
+	case session.isAuthorized(s.timeNow()):
+		if whois.Node.StableID == status.Self.ID {
+			s.lc.IncrementCounter(r.Context(), "web_client_managing_local", 1)
+		} else {
+			s.lc.IncrementCounter(r.Context(), "web_client_managing_remote", 1)
+		}
+		resp.CanManageNode = true
+		resp.AuthNeeded = ""
+	default:
+		// whois being nil implies local as the request did not come over Tailscale
+		if whois == nil || (whois.Node.StableID == status.Self.ID) {
+			s.lc.IncrementCounter(r.Context(), "web_client_viewing_local", 1)
+		} else {
+			s.lc.IncrementCounter(r.Context(), "web_client_viewing_remote", 1)
+		}
+		resp.AuthNeeded = tailscaleAuth
+	}
+
 	writeJSON(w, resp)
 }
 
@@ -463,7 +546,7 @@ type newSessionAuthResponse struct {
 
 // serveAPIAuthSessionNew handles requests to the /api/auth/session/new endpoint.
 func (s *Server) serveAPIAuthSessionNew(w http.ResponseWriter, r *http.Request) {
-	session, whois, err := s.getSession(r)
+	session, whois, _, err := s.getSession(r)
 	if err != nil && !errors.Is(err, errNoSession) {
 		// Source associated with request not allowed to create
 		// a session for this web client.
@@ -480,11 +563,19 @@ func (s *Server) serveAPIAuthSessionNew(w http.ResponseWriter, r *http.Request) 
 		}
 		// Set the cookie on browser.
 		http.SetCookie(w, &http.Cookie{
-			Name:    sessionCookieName,
-			Value:   session.ID,
-			Raw:     session.ID,
-			Path:    "/",
-			Expires: session.expires(),
+			Name:     sessionCookieName,
+			Value:    session.ID,
+			Raw:      session.ID,
+			Path:     "/",
+			HttpOnly: true,
+			SameSite: http.SameSiteStrictMode,
+			Expires:  session.expires(),
+			// We can't set Secure to true because we serve over HTTP
+			// (but only on Tailscale IPs, hence over encrypted
+			// connections that a LAN-local attacker cannot sniff).
+			// In the future, we could support HTTPS requests using
+			// the full MagicDNS hostname, and could set this.
+			// Secure:  true,
 		})
 	}
 
@@ -493,7 +584,7 @@ func (s *Server) serveAPIAuthSessionNew(w http.ResponseWriter, r *http.Request) 
 
 // serveAPIAuthSessionWait handles requests to the /api/auth/session/wait endpoint.
 func (s *Server) serveAPIAuthSessionWait(w http.ResponseWriter, r *http.Request) {
-	session, _, err := s.getSession(r)
+	session, _, _, err := s.getSession(r)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusUnauthorized)
 		return
@@ -522,6 +613,9 @@ func (s *Server) serveAPI(w http.ResponseWriter, r *http.Request) {
 		return
 	case path == "/routes" && r.Method == httpm.POST:
 		s.servePostRoutes(w, r)
+		return
+	case path == "/device-details-click" && r.Method == httpm.POST:
+		s.serveDeviceDetailsClick(w, r)
 		return
 	case strings.HasPrefix(path, "/local/"):
 		s.proxyRequestToLocalAPI(w, r)
@@ -555,10 +649,11 @@ type nodeData struct {
 	UnraidToken string
 	URLPrefix   string // if set, the URL prefix the client is served behind
 
-	UsingExitNode       *exitNode
-	AdvertisingExitNode bool
-	AdvertisedRoutes    []subnetRoute // excludes exit node routes
-	RunningSSHServer    bool
+	UsingExitNode               *exitNode
+	AdvertisingExitNode         bool
+	AdvertisingExitNodeApproved bool          // whether running this node as an exit node has been approved by an admin
+	AdvertisedRoutes            []subnetRoute // excludes exit node routes
+	RunningSSHServer            bool
 
 	ClientVersion *tailcfg.ClientVersion
 
@@ -594,11 +689,7 @@ func (s *Server) serveGetNodeData(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	filterRules, err := s.lc.DebugPacketFilterRules(r.Context())
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
+	filterRules, _ := s.lc.DebugPacketFilterRules(r.Context())
 	data := &nodeData{
 		ID:               st.Self.ID,
 		Status:           st.BackendState,
@@ -622,22 +713,23 @@ func (s *Server) serveGetNodeData(w http.ResponseWriter, r *http.Request) {
 		ACLAllowsAnyIncomingTraffic: s.aclsAllowAccess(filterRules),
 	}
 
+	ipv4, ipv6 := s.selfNodeAddresses(r, st)
+	data.IPv4 = ipv4.String()
+	data.IPv6 = ipv6.String()
+
+	if hostinfo.GetEnvType() == hostinfo.HomeAssistantAddOn && data.URLPrefix == "" {
+		// X-Ingress-Path is the path prefix in use for Home Assistant
+		// https://developers.home-assistant.io/docs/add-ons/presentation#ingress
+		data.URLPrefix = r.Header.Get("X-Ingress-Path")
+	}
+
 	cv, err := s.lc.CheckUpdate(r.Context())
 	if err != nil {
 		s.logf("could not check for updates: %v", err)
 	} else {
 		data.ClientVersion = cv
 	}
-	for _, ip := range st.TailscaleIPs {
-		if ip.Is4() {
-			data.IPv4 = ip.String()
-		} else if ip.Is6() {
-			data.IPv6 = ip.String()
-		}
-		if data.IPv4 != "" && data.IPv6 != "" {
-			break
-		}
-	}
+
 	if st.CurrentTailnet != nil {
 		data.TailnetName = st.CurrentTailnet.MagicDNSSuffix
 		data.DomainName = st.CurrentTailnet.Name
@@ -657,6 +749,8 @@ func (s *Server) serveGetNodeData(w http.ResponseWriter, r *http.Request) {
 			return p == route
 		})
 	}
+	data.AdvertisingExitNodeApproved = routeApproved(exitNodeRouteV4) || routeApproved(exitNodeRouteV6)
+
 	for _, r := range prefs.AdvertiseRoutes {
 		if r == exitNodeRouteV4 || r == exitNodeRouteV6 {
 			data.AdvertisingExitNode = true
@@ -693,13 +787,35 @@ func (s *Server) serveGetNodeData(w http.ResponseWriter, r *http.Request) {
 }
 
 func availableFeatures() map[string]bool {
-	return map[string]bool{
-		"advertise-exit-node": true,                            // available on all platforms
-		"advertise-routes":    true,                            // available on all platforms
-		"use-exit-node":       distro.Get() != distro.Synology, // see https://github.com/tailscale/tailscale/issues/1995
+	env := hostinfo.GetEnvType()
+	features := map[string]bool{
+		"advertise-exit-node": true, // available on all platforms
+		"advertise-routes":    true, // available on all platforms
+		"use-exit-node":       canUseExitNode(env) == nil,
 		"ssh":                 envknob.CanRunTailscaleSSH() == nil,
-		"auto-update":         clientupdate.CanAutoUpdate(),
+		"auto-update":         version.IsUnstableBuild() && clientupdate.CanAutoUpdate(),
 	}
+	if env == hostinfo.HomeAssistantAddOn {
+		// Setting SSH on Home Assistant causes trouble on startup
+		// (since the flag is not being passed to `tailscale up`).
+		// Although Tailscale SSH does work here,
+		// it's not terribly useful since it's running in a separate container.
+		features["ssh"] = false
+	}
+	return features
+}
+
+func canUseExitNode(env hostinfo.EnvType) error {
+	switch dist := distro.Get(); dist {
+	case distro.Synology, // see https://github.com/tailscale/tailscale/issues/1995
+		distro.QNAP,
+		distro.Unraid:
+		return fmt.Errorf("Tailscale exit nodes cannot be used on %s.", dist)
+	}
+	if env == hostinfo.HomeAssistantAddOn {
+		return errors.New("Tailscale exit nodes cannot be used on Home Assistant.")
+	}
+	return nil
 }
 
 // aclsAllowAccess returns whether tailnet ACLs (as expressed in the provided filter rules)
@@ -934,6 +1050,21 @@ func (s *Server) serveTailscaleUp(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// serveDeviceDetailsClick increments the web_client_device_details_click metric
+// by one.
+//
+// Metric logging from the frontend typically is proxied to the localapi. This event
+// has been special cased as access to the localapi is gated upon having a valid
+// session which is not always the case when we want to be logging this metric (e.g.,
+// when in readonly mode).
+//
+// Other metrics should not be logged in this way without a good reason.
+func (s *Server) serveDeviceDetailsClick(w http.ResponseWriter, r *http.Request) {
+	s.lc.IncrementCounter(r.Context(), "web_client_device_details_click", 1)
+
+	io.WriteString(w, "{}")
+}
+
 // proxyRequestToLocalAPI proxies the web API request to the localapi.
 //
 // The web API request path is expected to exactly match a localapi path,
@@ -946,6 +1077,13 @@ func (s *Server) proxyRequestToLocalAPI(w http.ResponseWriter, r *http.Request) 
 	if r.URL.Path == path { // missing prefix
 		http.Error(w, "invalid request", http.StatusBadRequest)
 		return
+	}
+	if r.Method == httpm.PATCH {
+		// enforce that PATCH requests are always application/json
+		if ct := r.Header.Get("Content-Type"); ct != "application/json" {
+			http.Error(w, "invalid request", http.StatusBadRequest)
+			return
+		}
 	}
 	if !slices.Contains(localapiAllowlist, path) {
 		http.Error(w, fmt.Sprintf("%s not allowed from localapi proxy", path), http.StatusForbidden)

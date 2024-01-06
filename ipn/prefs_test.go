@@ -20,6 +20,7 @@ import (
 	"tailscale.com/tailcfg"
 	"tailscale.com/tstest"
 	"tailscale.com/types/key"
+	"tailscale.com/types/opt"
 	"tailscale.com/types/persist"
 	"tailscale.com/types/preftype"
 )
@@ -294,18 +295,18 @@ func TestPrefsEqual(t *testing.T) {
 			false,
 		},
 		{
-			&Prefs{AutoUpdate: AutoUpdatePrefs{Check: true, Apply: false}},
-			&Prefs{AutoUpdate: AutoUpdatePrefs{Check: false, Apply: false}},
+			&Prefs{AutoUpdate: AutoUpdatePrefs{Check: true, Apply: opt.NewBool(false)}},
+			&Prefs{AutoUpdate: AutoUpdatePrefs{Check: false, Apply: opt.NewBool(false)}},
 			false,
 		},
 		{
-			&Prefs{AutoUpdate: AutoUpdatePrefs{Check: true, Apply: true}},
-			&Prefs{AutoUpdate: AutoUpdatePrefs{Check: true, Apply: false}},
+			&Prefs{AutoUpdate: AutoUpdatePrefs{Check: true, Apply: opt.NewBool(true)}},
+			&Prefs{AutoUpdate: AutoUpdatePrefs{Check: true, Apply: opt.NewBool(false)}},
 			false,
 		},
 		{
-			&Prefs{AutoUpdate: AutoUpdatePrefs{Check: true, Apply: false}},
-			&Prefs{AutoUpdate: AutoUpdatePrefs{Check: true, Apply: false}},
+			&Prefs{AutoUpdate: AutoUpdatePrefs{Check: true, Apply: opt.NewBool(false)}},
+			&Prefs{AutoUpdate: AutoUpdatePrefs{Check: true, Apply: opt.NewBool(false)}},
 			true,
 		},
 		{
@@ -522,7 +523,7 @@ func TestPrefsPretty(t *testing.T) {
 			Prefs{
 				AutoUpdate: AutoUpdatePrefs{
 					Check: true,
-					Apply: false,
+					Apply: opt.NewBool(false),
 				},
 			},
 			"linux",
@@ -532,7 +533,7 @@ func TestPrefsPretty(t *testing.T) {
 			Prefs{
 				AutoUpdate: AutoUpdatePrefs{
 					Check: true,
-					Apply: true,
+					Apply: opt.NewBool(true),
 				},
 			},
 			"linux",
@@ -760,6 +761,42 @@ func TestMaskedPrefsPretty(t *testing.T) {
 				ExitNodeIPSet: true,
 			},
 			want: `MaskedPrefs{ExitNodeIP=100.102.104.105}`,
+		},
+		{
+			m: &MaskedPrefs{
+				Prefs: Prefs{
+					AutoUpdate: AutoUpdatePrefs{Check: true, Apply: opt.NewBool(false)},
+				},
+				AutoUpdateSet: AutoUpdatePrefsMask{CheckSet: true, ApplySet: false},
+			},
+			want: `MaskedPrefs{AutoUpdate={Check=true}}`,
+		},
+		{
+			m: &MaskedPrefs{
+				Prefs: Prefs{
+					AutoUpdate: AutoUpdatePrefs{Check: true, Apply: opt.NewBool(true)},
+				},
+				AutoUpdateSet: AutoUpdatePrefsMask{CheckSet: true, ApplySet: true},
+			},
+			want: `MaskedPrefs{AutoUpdate={Check=true Apply=true}}`,
+		},
+		{
+			m: &MaskedPrefs{
+				Prefs: Prefs{
+					AutoUpdate: AutoUpdatePrefs{Check: true, Apply: opt.NewBool(false)},
+				},
+				AutoUpdateSet: AutoUpdatePrefsMask{CheckSet: false, ApplySet: true},
+			},
+			want: `MaskedPrefs{AutoUpdate={Apply=false}}`,
+		},
+		{
+			m: &MaskedPrefs{
+				Prefs: Prefs{
+					AutoUpdate: AutoUpdatePrefs{Check: true, Apply: opt.NewBool(true)},
+				},
+				AutoUpdateSet: AutoUpdatePrefsMask{CheckSet: false, ApplySet: false},
+			},
+			want: `MaskedPrefs{}`,
 		},
 	}
 	for i, tt := range tests {

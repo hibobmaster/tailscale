@@ -14,6 +14,7 @@ import (
 	"net/netip"
 	"reflect"
 	"regexp"
+	"slices"
 	"sync/atomic"
 	"testing"
 
@@ -218,19 +219,19 @@ func TestGetUPnPClient(t *testing.T) {
 			"google",
 			googleWifiRootDescXML,
 			"*internetgateway2.WANIPConnection2",
-			"saw UPnP type WANIPConnection2 at http://127.0.0.1:NNN/rootDesc.xml; OnHub (Google)\n",
+			"saw UPnP type WANIPConnection2 at http://127.0.0.1:NNN/rootDesc.xml; OnHub (Google), method=single\n",
 		},
 		{
 			"pfsense",
 			pfSenseRootDescXML,
 			"*internetgateway2.WANIPConnection1",
-			"saw UPnP type WANIPConnection1 at http://127.0.0.1:NNN/rootDesc.xml; FreeBSD router (FreeBSD)\n",
+			"saw UPnP type WANIPConnection1 at http://127.0.0.1:NNN/rootDesc.xml; FreeBSD router (FreeBSD), method=single\n",
 		},
 		{
 			"mikrotik",
 			mikrotikRootDescXML,
 			"*internetgateway2.WANIPConnection1",
-			"saw UPnP type WANIPConnection1 at http://127.0.0.1:NNN/rootDesc.xml; MikroTik Router (MikroTik)\n",
+			"saw UPnP type WANIPConnection1 at http://127.0.0.1:NNN/rootDesc.xml; MikroTik Router (MikroTik), method=none\n",
 		},
 		// TODO(bradfitz): find a PPP one in the wild
 	}
@@ -246,10 +247,17 @@ func TestGetUPnPClient(t *testing.T) {
 			defer ts.Close()
 			gw, _ := netip.AddrFromSlice(ts.Listener.Addr().(*net.TCPAddr).IP)
 			gw = gw.Unmap()
+
+			ctx := context.Background()
+
 			var logBuf tstest.MemLogger
-			c, err := getUPnPClient(context.Background(), logBuf.Logf, DebugKnobs{}, gw, uPnPDiscoResponse{
+			dev, loc, err := getUPnPRootDevice(ctx, logBuf.Logf, DebugKnobs{}, gw, uPnPDiscoResponse{
 				Location: ts.URL + "/rootDesc.xml",
 			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			c, err := selectBestService(ctx, logBuf.Logf, dev, loc)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -272,122 +280,292 @@ func TestGetUPnPPortMapping(t *testing.T) {
 	}
 	defer igd.Close()
 
-	rootDesc := ""
-
 	// This is a very basic fake UPnP server handler.
 	var sawRequestWithLease atomic.Bool
-	igd.SetUPnPHandler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		t.Logf("got UPnP request %s %s", r.Method, r.URL.Path)
-		switch r.URL.Path {
-		case "/rootDesc.xml":
-			io.WriteString(w, rootDesc)
-		case "/ctl/IPConn", "/upnp/control/yomkmsnooi/wanipconn-1":
-			body, err := io.ReadAll(r.Body)
-			if err != nil {
-				t.Errorf("error reading request body: %v", err)
-				http.Error(w, "bad request", http.StatusBadRequest)
-				return
+	handlers := map[string]any{
+		"AddPortMapping": func(body []byte) (int, string) {
+			// Decode a minimal body to determine whether we skip the request or not.
+			var req struct {
+				Protocol       string `xml:"NewProtocol"`
+				InternalPort   string `xml:"NewInternalPort"`
+				ExternalPort   string `xml:"NewExternalPort"`
+				InternalClient string `xml:"NewInternalClient"`
+				LeaseDuration  string `xml:"NewLeaseDuration"`
 			}
-
-			// Decode the request type.
-			var outerRequest struct {
-				Body struct {
-					Request struct {
-						XMLName xml.Name
-					} `xml:",any"`
-					Inner string `xml:",innerxml"`
-				} `xml:"Body"`
-			}
-			if err := xml.Unmarshal(body, &outerRequest); err != nil {
+			if err := xml.Unmarshal(body, &req); err != nil {
 				t.Errorf("bad request: %v", err)
-				http.Error(w, "bad request", http.StatusBadRequest)
-				return
+				return http.StatusBadRequest, "bad request"
 			}
 
-			requestType := outerRequest.Body.Request.XMLName.Local
-			upnpRequest := outerRequest.Body.Inner
-			t.Logf("UPnP request: %s", requestType)
-
-			switch requestType {
-			case "AddPortMapping":
-				// Decode a minimal body to determine whether we skip the request or not.
-				var req struct {
-					Protocol       string `xml:"NewProtocol"`
-					InternalPort   string `xml:"NewInternalPort"`
-					ExternalPort   string `xml:"NewExternalPort"`
-					InternalClient string `xml:"NewInternalClient"`
-					LeaseDuration  string `xml:"NewLeaseDuration"`
-				}
-				if err := xml.Unmarshal([]byte(upnpRequest), &req); err != nil {
-					t.Errorf("bad request: %v", err)
-					http.Error(w, "bad request", http.StatusBadRequest)
-					return
-				}
-
-				if req.Protocol != "UDP" {
-					t.Errorf(`got Protocol=%q, want "UDP"`, req.Protocol)
-				}
-				if req.LeaseDuration != "0" {
-					// Return a fake error to ensure that we fall back to a permanent lease.
-					io.WriteString(w, testAddPortMappingPermanentLease)
-					sawRequestWithLease.Store(true)
-				} else {
-					// Success!
-					io.WriteString(w, testAddPortMappingResponse)
-				}
-			case "GetExternalIPAddress":
-				io.WriteString(w, testGetExternalIPAddressResponse)
-
-			case "DeletePortMapping":
-				// Do nothing for test
-
-			default:
-				t.Errorf("unhandled UPnP request type %q", requestType)
-				http.Error(w, "bad request", http.StatusBadRequest)
+			if req.Protocol != "UDP" {
+				t.Errorf(`got Protocol=%q, want "UDP"`, req.Protocol)
 			}
-		default:
-			t.Logf("ignoring request")
-			http.NotFound(w, r)
-		}
-	}))
+			if req.LeaseDuration != "0" {
+				// Return a fake error to ensure that we fall back to a permanent lease.
+				sawRequestWithLease.Store(true)
+				return http.StatusOK, testAddPortMappingPermanentLease
+			}
+
+			// Success!
+			return http.StatusOK, testAddPortMappingResponse
+		},
+		"GetExternalIPAddress": testGetExternalIPAddressResponse,
+		"GetStatusInfo":        testGetStatusInfoResponse,
+		"DeletePortMapping":    "", // Do nothing for test
+	}
 
 	ctx := context.Background()
 
 	rootDescsToTest := []string{testRootDesc, mikrotikRootDescXML}
+	for _, rootDesc := range rootDescsToTest {
+		igd.SetUPnPHandler(&upnpServer{
+			t:    t,
+			Desc: rootDesc,
+			Control: map[string]map[string]any{
+				"/ctl/IPConn":                          handlers,
+				"/upnp/control/yomkmsnooi/wanipconn-1": handlers,
+			},
+		})
 
-	for _, rootDesc = range rootDescsToTest {
 		c := newTestClient(t, igd)
 		t.Logf("Listening on upnp=%v", c.testUPnPPort)
 		defer c.Close()
 
 		c.debug.VerboseLogs = true
 
-		sawRequestWithLease.Store(false)
-		res, err := c.Probe(ctx)
-		if err != nil {
-			t.Fatalf("Probe: %v", err)
-		}
-		if !res.UPnP {
-			t.Errorf("didn't detect UPnP")
-		}
+		// Try twice to test the "cache previous mapping" logic.
+		var (
+			firstResponse netip.AddrPort
+			prevPort      uint16
+		)
+		for i := 0; i < 2; i++ {
+			sawRequestWithLease.Store(false)
+			res, err := c.Probe(ctx)
+			if err != nil {
+				t.Fatalf("Probe: %v", err)
+			}
+			if !res.UPnP {
+				t.Errorf("didn't detect UPnP")
+			}
 
-		gw, myIP, ok := c.gatewayAndSelfIP()
-		if !ok {
-			t.Fatalf("could not get gateway and self IP")
-		}
-		t.Logf("gw=%v myIP=%v", gw, myIP)
+			gw, myIP, ok := c.gatewayAndSelfIP()
+			if !ok {
+				t.Fatalf("could not get gateway and self IP")
+			}
+			t.Logf("gw=%v myIP=%v", gw, myIP)
 
-		ext, ok := c.getUPnPPortMapping(ctx, gw, netip.AddrPortFrom(myIP, 12345), 0)
-		if !ok {
-			t.Fatal("could not get UPnP port mapping")
+			ext, ok := c.getUPnPPortMapping(ctx, gw, netip.AddrPortFrom(myIP, 12345), prevPort)
+			if !ok {
+				t.Fatal("could not get UPnP port mapping")
+			}
+			if got, want := ext.Addr(), netip.MustParseAddr("123.123.123.123"); got != want {
+				t.Errorf("bad external address; got %v want %v", got, want)
+			}
+			if !sawRequestWithLease.Load() {
+				t.Errorf("wanted request with lease, but didn't see one")
+			}
+			if i == 0 {
+				firstResponse = ext
+				prevPort = ext.Port()
+			} else if firstResponse != ext {
+				t.Errorf("got different response on second attempt: (got) %v != %v (want)", ext, firstResponse)
+			}
+			t.Logf("external IP: %v", ext)
 		}
-		if got, want := ext.Addr(), netip.MustParseAddr("123.123.123.123"); got != want {
-			t.Errorf("bad external address; got %v want %v", got, want)
+	}
+}
+
+func TestGetUPnPPortMappingNoResponses(t *testing.T) {
+	igd, err := NewTestIGD(t.Logf, TestIGDOptions{UPnP: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer igd.Close()
+
+	c := newTestClient(t, igd)
+	t.Logf("Listening on upnp=%v", c.testUPnPPort)
+	defer c.Close()
+
+	c.debug.VerboseLogs = true
+
+	// Do this before setting uPnPMetas since it invalidates those mappings
+	// if gw/myIP change.
+	gw, myIP, _ := c.gatewayAndSelfIP()
+
+	t.Run("ErrorContactingUPnP", func(t *testing.T) {
+		c.mu.Lock()
+		c.uPnPMetas = []uPnPDiscoResponse{{
+			Location: "http://127.0.0.1:1/does-not-exist.xml",
+			Server:   "Tailscale-Test/1.0 UPnP/1.1 MiniUPnPd/2.2.1",
+			USN:      "uuid:bee7052b-49e8-3597-b545-55a1e38ac11::urn:schemas-upnp-org:device:InternetGatewayDevice:2",
+		}}
+		c.mu.Unlock()
+
+		_, ok := c.getUPnPPortMapping(context.Background(), gw, netip.AddrPortFrom(myIP, 12345), 0)
+		if ok {
+			t.Errorf("expected no mapping when there are no responses")
 		}
-		if !sawRequestWithLease.Load() {
-			t.Errorf("wanted request with lease, but didn't see one")
-		}
-		t.Logf("external IP: %v", ext)
+	})
+}
+
+func TestProcessUPnPResponses(t *testing.T) {
+	testCases := []struct {
+		name      string
+		responses []uPnPDiscoResponse
+		want      []uPnPDiscoResponse
+	}{
+		{
+			name: "single",
+			responses: []uPnPDiscoResponse{{
+				Location: "http://192.168.1.1:2828/control.xml",
+				Server:   "Tailscale-Test/1.0 UPnP/1.1 MiniUPnPd/2.2.1",
+				USN:      "uuid:bee7052b-49e8-3597-b545-55a1e38ac11::urn:schemas-upnp-org:device:InternetGatewayDevice:1",
+			}},
+			want: []uPnPDiscoResponse{{
+				Location: "http://192.168.1.1:2828/control.xml",
+				Server:   "Tailscale-Test/1.0 UPnP/1.1 MiniUPnPd/2.2.1",
+				USN:      "uuid:bee7052b-49e8-3597-b545-55a1e38ac11::urn:schemas-upnp-org:device:InternetGatewayDevice:1",
+			}},
+		},
+		{
+			name: "multiple_with_same_location",
+			responses: []uPnPDiscoResponse{
+				{
+					Location: "http://192.168.1.1:2828/control.xml",
+					Server:   "Tailscale-Test/1.0 UPnP/1.1 MiniUPnPd/2.2.1",
+					USN:      "uuid:bee7052b-49e8-3597-b545-55a1e38ac11::urn:schemas-upnp-org:device:InternetGatewayDevice:1",
+				},
+				{
+					Location: "http://192.168.1.1:2828/control.xml",
+					Server:   "Tailscale-Test/1.0 UPnP/1.1 MiniUPnPd/2.2.1",
+					USN:      "uuid:bee7052b-49e8-3597-b545-55a1e38ac11::urn:schemas-upnp-org:device:InternetGatewayDevice:2",
+				},
+			},
+			want: []uPnPDiscoResponse{{
+				Location: "http://192.168.1.1:2828/control.xml",
+				Server:   "Tailscale-Test/1.0 UPnP/1.1 MiniUPnPd/2.2.1",
+				USN:      "uuid:bee7052b-49e8-3597-b545-55a1e38ac11::urn:schemas-upnp-org:device:InternetGatewayDevice:2",
+			}},
+		},
+		{
+			name: "multiple_with_different_location",
+			responses: []uPnPDiscoResponse{
+				{
+					Location: "http://192.168.1.1:2828/control.xml",
+					Server:   "Tailscale-Test/1.0 UPnP/1.1 MiniUPnPd/2.2.1",
+					USN:      "uuid:bee7052b-49e8-3597-b545-55a1e38ac11::urn:schemas-upnp-org:device:InternetGatewayDevice:1",
+				},
+				{
+					Location: "http://192.168.100.1:2828/control.xml",
+					Server:   "Tailscale-Test/1.0 UPnP/1.1 MiniUPnPd/2.2.1",
+					USN:      "uuid:bee7052b-49e8-3597-b545-55a1e38ac11::urn:schemas-upnp-org:device:InternetGatewayDevice:2",
+				},
+			},
+			want: []uPnPDiscoResponse{
+				// note: this sorts first because we prefer "InternetGatewayDevice:2"
+				{
+					Location: "http://192.168.100.1:2828/control.xml",
+					Server:   "Tailscale-Test/1.0 UPnP/1.1 MiniUPnPd/2.2.1",
+					USN:      "uuid:bee7052b-49e8-3597-b545-55a1e38ac11::urn:schemas-upnp-org:device:InternetGatewayDevice:2",
+				},
+				{
+					Location: "http://192.168.1.1:2828/control.xml",
+					Server:   "Tailscale-Test/1.0 UPnP/1.1 MiniUPnPd/2.2.1",
+					USN:      "uuid:bee7052b-49e8-3597-b545-55a1e38ac11::urn:schemas-upnp-org:device:InternetGatewayDevice:1",
+				},
+			},
+		},
+	}
+	for _, tt := range testCases {
+		t.Run(tt.name, func(t *testing.T) {
+			got := processUPnPResponses(slices.Clone(tt.responses))
+			if !reflect.DeepEqual(got, tt.want) {
+				t.Errorf("unexpected result:\n got: %+v\nwant: %+v\n", got, tt.want)
+			}
+		})
+	}
+}
+
+type upnpServer struct {
+	t       *testing.T
+	Desc    string                    // root device XML
+	Control map[string]map[string]any // map["/url"]map["UPnPService"]response
+}
+
+func (u *upnpServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	u.t.Logf("got UPnP request %s %s", r.Method, r.URL.Path)
+	if r.URL.Path == "/rootDesc.xml" {
+		io.WriteString(w, u.Desc)
+		return
+	}
+	if control, ok := u.Control[r.URL.Path]; ok {
+		u.handleControl(w, r, control)
+		return
+	}
+
+	u.t.Logf("ignoring request")
+	http.NotFound(w, r)
+}
+
+func (u *upnpServer) handleControl(w http.ResponseWriter, r *http.Request, handlers map[string]any) {
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		u.t.Errorf("error reading request body: %v", err)
+		http.Error(w, "bad request", http.StatusBadRequest)
+		return
+	}
+
+	// Decode the request type.
+	var outerRequest struct {
+		Body struct {
+			Request struct {
+				XMLName xml.Name
+			} `xml:",any"`
+			Inner string `xml:",innerxml"`
+		} `xml:"Body"`
+	}
+	if err := xml.Unmarshal(body, &outerRequest); err != nil {
+		u.t.Errorf("bad request: %v", err)
+		http.Error(w, "bad request", http.StatusBadRequest)
+		return
+	}
+
+	requestType := outerRequest.Body.Request.XMLName.Local
+	upnpRequest := outerRequest.Body.Inner
+	u.t.Logf("UPnP request: %s", requestType)
+
+	handler, ok := handlers[requestType]
+	if !ok {
+		u.t.Errorf("unhandled UPnP request type %q", requestType)
+		http.Error(w, "bad request", http.StatusBadRequest)
+		return
+	}
+
+	switch v := handler.(type) {
+	case string:
+		io.WriteString(w, v)
+	case []byte:
+		w.Write(v)
+
+	// Function handlers
+	case func(string) string:
+		io.WriteString(w, v(upnpRequest))
+	case func([]byte) string:
+		io.WriteString(w, v([]byte(upnpRequest)))
+
+	case func(string) (int, string):
+		code, body := v(upnpRequest)
+		w.WriteHeader(code)
+		io.WriteString(w, body)
+	case func([]byte) (int, string):
+		code, body := v([]byte(upnpRequest))
+		w.WriteHeader(code)
+		io.WriteString(w, body)
+
+	default:
+		u.t.Fatalf("invalid handler type: %T", v)
+		http.Error(w, "invalid handler type", http.StatusInternalServerError)
+		return
 	}
 }
 
@@ -483,6 +661,18 @@ const testGetExternalIPAddressResponse = `<?xml version="1.0"?>
     <u:GetExternalIPAddressResponse xmlns:u="urn:schemas-upnp-org:service:WANIPConnection:1">
       <NewExternalIPAddress>123.123.123.123</NewExternalIPAddress>
     </u:GetExternalIPAddressResponse>
+  </s:Body>
+</s:Envelope>
+`
+
+const testGetStatusInfoResponse = `<?xml version="1.0"?>
+<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/" s:encodingStyle="http://schemas.xmlsoap.org/soap/encoding/">
+  <s:Body>
+    <u:GetStatusInfoResponse xmlns:u="urn:schemas-upnp-org:service:WANIPConnection:1">
+      <NewConnectionStatus>Connected</NewConnectionStatus>
+      <NewLastConnectionError>ERROR_NONE</NewLastConnectionError>
+      <NewUptime>9999</NewUptime>
+    </u:GetStatusInfoResponse>
   </s:Body>
 </s:Envelope>
 `

@@ -107,8 +107,8 @@ function LoginPopoverContent({
     setIsRunningCheck(true)
     fetch(`http://${node.IPv4}:5252/ok`, { mode: "no-cors" })
       .then(() => {
-        setIsRunningCheck(false)
         setCanConnectOverTS(true)
+        setIsRunningCheck(false)
       })
       .catch(() => setIsRunningCheck(false))
   }, [auth.viewerIdentity, isRunningCheck, node.IPv4])
@@ -125,8 +125,15 @@ function LoginPopoverContent({
   useEffect(() => checkTSConnection(), [])
 
   const handleSignInClick = useCallback(() => {
-    if (auth.viewerIdentity) {
-      newSession()
+    if (auth.viewerIdentity && auth.serverMode === "manage") {
+      if (window.self !== window.top) {
+        // if we're inside an iframe, start session in new window
+        let url = new URL(window.location.href)
+        url.searchParams.set("check", "now")
+        window.open(url, "_blank")
+      } else {
+        newSession()
+      }
     } else {
       // Must be connected over Tailscale to log in.
       // Send user to Tailscale IP and start check mode
@@ -138,7 +145,7 @@ function LoginPopoverContent({
         window.location.href = manageURL
       }
     }
-  }, [node.IPv4, auth.viewerIdentity, newSession])
+  }, [auth.viewerIdentity, auth.serverMode, newSession, node.IPv4])
 
   return (
     <div onMouseEnter={!canConnectOverTS ? checkTSConnection : undefined}>
